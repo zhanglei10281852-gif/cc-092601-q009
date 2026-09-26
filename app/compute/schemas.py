@@ -13,6 +13,8 @@ class TemplateCreate(BaseModel):
     default_parameters: dict[str, Any] = Field(default_factory=dict)
     max_runtime_seconds: int = Field(default=600, ge=1, le=86400)
     max_attempts: int = Field(default=3, ge=1, le=20)
+    estimated_cpu_seconds: int | None = Field(default=None, ge=0, le=10**9)
+    estimated_memory_hours: float = Field(default=0.0, ge=0, le=10**9)
 
 
 class QuotaSet(BaseModel):
@@ -49,6 +51,7 @@ class TaskFailure(BaseModel):
     error_code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
     retryable: bool = True
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class CancelRequest(BaseModel):
@@ -66,6 +69,23 @@ class PriorityRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=2, max_length=1000)
     priority: int = Field(ge=0, le=100)
+
+
+class BudgetAdjust(BaseModel):
+    """管理员对项目当期预算的额度调整，正数为追加、负数为核减，必须填写说明。"""
+
+    project_code: str = Field(min_length=1, max_length=80)
+    period: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    cpu_seconds: int = Field(default=0, ge=-(10**12), le=10**12)
+    memory_hours: float = Field(default=0.0, ge=-(10**12), le=10**12)
+    tasks: int = Field(default=0, ge=-(10**9), le=10**9)
+    reason: str = Field(min_length=2, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_delta(self) -> "BudgetAdjust":
+        if self.cpu_seconds == 0 and self.memory_hours == 0 and self.tasks == 0:
+            raise ValueError("调整至少包含一个非零额度")
+        return self
 
 
 class BatchOperation(BaseModel):

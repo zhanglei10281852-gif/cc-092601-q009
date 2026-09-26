@@ -17,8 +17,13 @@ def digest(value: Any) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def budget_period(value: datetime) -> str:
+    """预算周期按 UTC 自然月划分，例如 2026-09。"""
+    return value.astimezone(UTC).strftime("%Y-%m")
+
+
 class ComputeOperationsService:
-    """管理计算模板、配额、任务租约、结果版本和人工干预。"""
+    """管理计算模板、配额、任务租约、结果版本、项目预算和人工干预。"""
 
     def __init__(self, connection: sqlite3.Connection | None = None, clock: Clock | None = None) -> None:
         self.connection = connection or get_connection()
@@ -31,6 +36,10 @@ class ComputeOperationsService:
     def create_template(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         self._validate_schema(payload["parameter_schema"], payload["default_parameters"])
         now = to_storage(self.clock.now())
+        # 未显式给出 CPU 秒估算值时按模板最大运行时长保守估计
+        estimated_cpu = payload.get("estimated_cpu_seconds")
+        if estimated_cpu is None:
+            estimated_cpu = payload["max_runtime_seconds"]
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
             if repository.template_by_code(payload["code"]):
@@ -39,6 +48,7 @@ class ComputeOperationsService:
                 code=payload["code"], name=payload["name"], algorithm=payload["algorithm"],
                 parameter_schema=payload["parameter_schema"], defaults=payload["default_parameters"],
                 max_runtime_seconds=payload["max_runtime_seconds"], max_attempts=payload["max_attempts"],
+                estimated_cpu_seconds=estimated_cpu, estimated_memory_hours=payload.get("estimated_memory_hours", 0.0),
                 created_by=actor, now=now,
             )
 
@@ -61,14 +71,67 @@ class ComputeOperationsService:
             if existing is not None:
                 if existing["parameter_digest"] != parameter_digest:
                     raise ConflictError("同一幂等键对应了不同的计算参数")
-                return dict(repository.task_by_id(existing["id"]))
-            self._check_quota(repository, payload["requested_by"], now_value)
-            return repository.create_task(
-                template_id=template["id"], project_code=payload["project_code"],
-                requested_by=payload["requested_by"], parameters=parameters,
-                parameter_digest=parameter_digest, priority=payload["priority"],
-                idempotency_key=payload["idempotency_key"], max_attempts=template["max_attempts"], now=now,
+                task = dict(repository.task_by_id(existing["id"]))
+            else:
+                self._check_quota(repository, payload["requested_by"], now_value)
+                task = repository.create_task(
+                    template_id=template["id"], project_code=payload["project_code"],
+                    requested_by=payload["requested_by"], parameters=parameters,
+                    parameter_digest=parameter_digest, priority=payload["priority"],
+                    idempotency_key=payload["idempotency_key"], max_attempts=template["max_attempts"],
+                    estimated_cpu_seconds=int(template["estimated_cpu_seconds"]),
+                    estimated_memory_hours=float(template["estimated_memory_hours"]), now=now,
+                )
+            task["budget_precheck"] = self._budget_precheck(repository, task, now_value)
+            return task
+
+    def adjust_budget(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        period = payload["period"] or budget_period(now_value)
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            repository.ensure_budget(payload["project_code"], period, now)
+            adjusted = repository.adjust_budget(
+                project_code=payload["project_code"], period=period,
+                cpu_seconds=payload["cpu_seconds"], memory_hours=payload["memory_hours"],
+                tasks=payload["tasks"], now=now,
             )
+            if not adjusted:
+                raise ValidationError("调整会使项目当期额度变为负数")
+            repository.add_budget_event(
+                project_code=payload["project_code"], period=period, task_id=None, event_type="grant",
+                cpu_seconds=payload["cpu_seconds"], memory_hours=payload["memory_hours"], tasks=payload["tasks"],
+                reason=payload["reason"], actor=actor, now=now,
+            )
+        return self.budget_summary(payload["project_code"], period)
+
+    def budget_summary(self, project_code: str, period: str | None = None) -> dict[str, Any]:
+        period = period or budget_period(self.clock.now())
+        return self._summary_for(self.repository, project_code, period)
+
+    @staticmethod
+    def _summary_for(repository: ComputeRepository, project_code: str, period: str) -> dict[str, Any]:
+        row = repository.budget(project_code, period)
+        if row is None:
+            return {
+                "project_code": project_code, "period": period, "tracked": False,
+                "granted": None, "reserved": None, "used": None, "available": None,
+                "rejected_tasks": 0,
+            }
+        granted = {"cpu_seconds": int(row["granted_cpu_seconds"]), "memory_hours": float(row["granted_memory_hours"]), "tasks": int(row["granted_tasks"])}
+        reserved = {"cpu_seconds": int(row["reserved_cpu_seconds"]), "memory_hours": float(row["reserved_memory_hours"]), "tasks": int(row["reserved_tasks"])}
+        used = {"cpu_seconds": int(row["used_cpu_seconds"]), "memory_hours": float(row["used_memory_hours"]), "tasks": int(row["used_tasks"])}
+        available = {key: granted[key] - reserved[key] - used[key] for key in granted}
+        return {
+            "project_code": project_code, "period": period, "tracked": True,
+            "granted": granted, "reserved": reserved, "used": used, "available": available,
+            "rejected_tasks": int(row["rejected_tasks"]),
+        }
+
+    def budget_events(self, project_code: str, period: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        period = period or budget_period(self.clock.now())
+        return self.repository.budget_events(project_code=project_code, period=period, limit=max(1, min(limit, 500)))
 
     def list_tasks(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_tasks(status=status, project_code=project_code, requested_by=requested_by, limit=max(1, min(limit, 500)))
@@ -86,18 +149,42 @@ class ComputeOperationsService:
         now_value = self.clock.now()
         now = to_storage(now_value)
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
+        period = budget_period(now_value)
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            candidate = repository.queued_candidate(capabilities, now)
-            if candidate is None:
-                return None
-            cursor = connection.execute(
-                "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
-                (worker_id, lease_until, now, now, candidate["id"]),
-            )
-            if cursor.rowcount != 1:
-                return None
-            return dict(repository.task_by_id(candidate["id"]))
+            for candidate in repository.queued_candidates(capabilities, now):
+                budget = repository.budget(candidate["project_code"], period)
+                reserved = False
+                if budget is not None:
+                    # 项目配置了当期预算：先原子预留，额度不足则保留排队原因并跳过
+                    reserved = repository.try_reserve(
+                        project_code=candidate["project_code"], period=period,
+                        cpu_seconds=int(candidate["estimated_cpu_seconds"]),
+                        memory_hours=float(candidate["estimated_memory_hours"]), now=now,
+                    )
+                    if not reserved:
+                        self._mark_budget_denied(connection, repository, candidate, period, now)
+                        continue
+                    repository.add_budget_event(
+                        project_code=candidate["project_code"], period=period, task_id=candidate["id"], event_type="reserve",
+                        cpu_seconds=int(candidate["estimated_cpu_seconds"]), memory_hours=float(candidate["estimated_memory_hours"]),
+                        tasks=1, reason="领取任务按模板估算值预留预算", actor=worker_id, now=now,
+                    )
+                cursor = connection.execute(
+                    "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
+                    (worker_id, lease_until, now, now, candidate["id"]),
+                )
+                if cursor.rowcount != 1:
+                    if reserved:
+                        self._release_reservation(repository, candidate["project_code"], period, candidate["id"], int(candidate["estimated_cpu_seconds"]), float(candidate["estimated_memory_hours"]), "领取竞争失败，回滚预算预留", "system", now)
+                    continue
+                if reserved:
+                    connection.execute(
+                        "UPDATE compute_tasks SET budget_period=?,budget_reserved=1,reserved_cpu_seconds=?,reserved_memory_hours=?,budget_denied_period='' WHERE id=?",
+                        (period, int(candidate["estimated_cpu_seconds"]), float(candidate["estimated_memory_hours"]), candidate["id"]),
+                    )
+                return dict(repository.task_by_id(candidate["id"]))
+            return None
 
     def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()
@@ -130,9 +217,10 @@ class ComputeOperationsService:
                 "UPDATE compute_tasks SET status='succeeded',current_result_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (version, now, now, task_id),
             )
+            self._settle_budget(connection, repository, task, metrics, worker_id, now)
             return dict(repository.task_by_id(task_id))
 
-    def fail(self, task_id: int, worker_id: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
+    def fail(self, task_id: int, worker_id: str, error_code: str, message: str, retryable: bool, metrics: dict[str, Any] | None = None) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         with transaction(immediate=True) as connection:
@@ -150,6 +238,7 @@ class ComputeOperationsService:
                 "UPDATE compute_tasks SET status=?,available_at=?,lease_owner='',lease_expires_at='',last_error_code=?,last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (status, available, error_code, message[:2000], None if can_retry else now, now, task_id),
             )
+            self._settle_budget(connection, repository, task, metrics or {}, worker_id, now)
             return dict(repository.task_by_id(task_id))
 
     def cancel(self, task_id: int, actor: str, reason: str, batch_key: str = "") -> dict[str, Any]:
@@ -191,12 +280,16 @@ class ComputeOperationsService:
         now = to_storage(self.clock.now())
         recovered: list[int] = []
         exhausted: list[int] = []
+        cancelled: list[int] = []
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            rows = connection.execute("SELECT * FROM compute_tasks WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
+            rows = connection.execute("SELECT * FROM compute_tasks WHERE status IN ('running','cancel_requested') AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
             for task in rows:
                 before = dict(task)
-                if int(task["attempt_count"]) < int(task["max_attempts"]):
+                if task["status"] == "cancel_requested":
+                    status, finished_at = "cancelled", now
+                    cancelled.append(int(task["id"]))
+                elif int(task["attempt_count"]) < int(task["max_attempts"]):
                     status, finished_at = "queued", None
                     recovered.append(int(task["id"]))
                 else:
@@ -206,9 +299,16 @@ class ComputeOperationsService:
                     "UPDATE compute_tasks SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='工作者租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                     (status, now, finished_at, now, task["id"]),
                 )
+                if task["budget_reserved"]:
+                    # 失联工作者不会回执，预留全额释放、不计已用，避免预算泄漏
+                    self._release_reservation(repository, task["project_code"], task["budget_period"], task["id"], int(task["reserved_cpu_seconds"]), float(task["reserved_memory_hours"]), "租约过期自动恢复，释放预留预算", actor, now)
+                    connection.execute(
+                        "UPDATE compute_tasks SET budget_reserved=0,reserved_cpu_seconds=0,reserved_memory_hours=0 WHERE id=?",
+                        (task["id"],),
+                    )
                 after = dict(repository.task_by_id(task["id"]))
                 repository.add_intervention(task_id=task["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
-        return {"recovered": recovered, "exhausted": exhausted}
+        return {"recovered": recovered, "exhausted": exhausted, "cancelled": cancelled}
 
     def summary(self) -> dict[str, Any]:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM compute_tasks GROUP BY status ORDER BY status").fetchall()
@@ -247,6 +347,79 @@ class ComputeOperationsService:
         day_start = to_storage(now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0))
         if repository.count_user_submissions_since(requested_by, day_start) >= int(quota["daily_submissions"]):
             raise ConflictError("用户当日提交配额已用尽")
+
+    def _budget_precheck(self, repository: ComputeRepository, task: dict[str, Any], now: datetime) -> dict[str, Any]:
+        """提交时的可见预检查：只报告估算值与当期可用额度，不拦截提交。"""
+        period = budget_period(now)
+        required = {
+            "cpu_seconds": int(task["estimated_cpu_seconds"]),
+            "memory_hours": float(task["estimated_memory_hours"]),
+            "tasks": 1,
+        }
+        summary = self._summary_for(repository, task["project_code"], period)
+        precheck: dict[str, Any] = {"period": period, "required": required, "tracked": summary["tracked"]}
+        if summary["tracked"]:
+            available = summary["available"]
+            precheck["available"] = available
+            precheck["fits"] = all(required[key] <= available[key] for key in required)
+        else:
+            precheck["available"] = None
+            precheck["fits"] = None
+        return precheck
+
+    def _mark_budget_denied(self, connection: sqlite3.Connection, repository: ComputeRepository, task: sqlite3.Row, period: str, now: str) -> None:
+        """超预算任务保持排队并记录原因；同一周期内同一任务只记一次拒绝。"""
+        if task["last_error_code"] == "budget_exceeded" and task["budget_denied_period"] == period:
+            return
+        message = f"项目 {task['project_code']} 在 {period} 周期的预算不足以预留该任务"
+        connection.execute(
+            "UPDATE compute_tasks SET last_error_code='budget_exceeded',last_error_message=?,budget_denied_period=?,updated_at=?,version=version+1 WHERE id=?",
+            (message, period, now, task["id"]),
+        )
+        repository.increment_rejected(project_code=task["project_code"], period=period, now=now)
+        repository.add_budget_event(
+            project_code=task["project_code"], period=period, task_id=task["id"], event_type="deny",
+            cpu_seconds=int(task["estimated_cpu_seconds"]), memory_hours=float(task["estimated_memory_hours"]),
+            tasks=1, reason="项目当期预算不足，任务保持排队", actor="system", now=now,
+        )
+
+    def _release_reservation(self, repository: ComputeRepository, project_code: str, period: str, task_id: int, cpu_seconds: int, memory_hours: float, reason: str, actor: str, now: str) -> None:
+        repository.release_reservation(project_code=project_code, period=period, cpu_seconds=cpu_seconds, memory_hours=memory_hours, now=now)
+        repository.add_budget_event(
+            project_code=project_code, period=period, task_id=task_id, event_type="release",
+            cpu_seconds=cpu_seconds, memory_hours=memory_hours, tasks=1, reason=reason, actor=actor, now=now,
+        )
+
+    def _settle_budget(self, connection: sqlite3.Connection, repository: ComputeRepository, task: sqlite3.Row, metrics: dict[str, Any], worker_id: str, now: str) -> None:
+        """回执结算：预留全额退回，按实际指标计入已用，预留周期不变避免跨周期串账。"""
+        if not task["budget_reserved"]:
+            return
+        reserved_cpu = int(task["reserved_cpu_seconds"])
+        reserved_memory = float(task["reserved_memory_hours"])
+        actual_cpu, actual_memory = self._usage_from_metrics(metrics, reserved_cpu, reserved_memory)
+        project_code, period = task["project_code"], task["budget_period"]
+        self._release_reservation(repository, project_code, period, task["id"], reserved_cpu, reserved_memory, "回执结算，释放预留额度", worker_id, now)
+        repository.settle_usage(project_code=project_code, period=period, cpu_seconds=actual_cpu, memory_hours=actual_memory, now=now)
+        repository.add_budget_event(
+            project_code=project_code, period=period, task_id=task["id"], event_type="settle",
+            cpu_seconds=actual_cpu, memory_hours=actual_memory, tasks=1,
+            reason="按回执实际指标结算", actor=worker_id, now=now,
+        )
+        connection.execute(
+            "UPDATE compute_tasks SET budget_reserved=0,reserved_cpu_seconds=0,reserved_memory_hours=0 WHERE id=?",
+            (task["id"],),
+        )
+
+    @staticmethod
+    def _usage_from_metrics(metrics: dict[str, Any], reserved_cpu: int, reserved_memory: float) -> tuple[int, float]:
+        """从回执指标提取实际用量；缺项按预留量结算，避免失联或漏报造成预算泄漏。"""
+        cpu = metrics.get("cpu_seconds", reserved_cpu)
+        if isinstance(cpu, bool) or not isinstance(cpu, (int, float)) or cpu < 0 or int(cpu) != cpu:
+            raise ValidationError("指标 cpu_seconds 必须是非负整数")
+        memory = metrics.get("memory_hours", reserved_memory)
+        if isinstance(memory, bool) or not isinstance(memory, (int, float)) or memory < 0:
+            raise ValidationError("指标 memory_hours 必须是非负数值")
+        return int(cpu), float(memory)
 
     @staticmethod
     def _validate_schema(schema: dict[str, dict[str, Any]], defaults: dict[str, Any]) -> None:

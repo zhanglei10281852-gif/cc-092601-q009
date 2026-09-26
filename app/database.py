@@ -226,6 +226,8 @@ CREATE TABLE IF NOT EXISTS compute_templates (
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
     max_runtime_seconds INTEGER NOT NULL CHECK(max_runtime_seconds > 0),
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    estimated_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(estimated_cpu_seconds >= 0),
+    estimated_memory_hours REAL NOT NULL DEFAULT 0 CHECK(estimated_memory_hours >= 0),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -261,6 +263,13 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    estimated_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(estimated_cpu_seconds >= 0),
+    estimated_memory_hours REAL NOT NULL DEFAULT 0 CHECK(estimated_memory_hours >= 0),
+    budget_period TEXT NOT NULL DEFAULT '',
+    budget_reserved INTEGER NOT NULL DEFAULT 0 CHECK(budget_reserved IN (0,1)),
+    reserved_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(reserved_cpu_seconds >= 0),
+    reserved_memory_hours REAL NOT NULL DEFAULT 0 CHECK(reserved_memory_hours >= 0),
+    budget_denied_period TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -293,6 +302,39 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+
+CREATE TABLE IF NOT EXISTS compute_budgets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_code TEXT NOT NULL,
+    period TEXT NOT NULL,
+    granted_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(granted_cpu_seconds >= 0),
+    granted_memory_hours REAL NOT NULL DEFAULT 0 CHECK(granted_memory_hours >= 0),
+    granted_tasks INTEGER NOT NULL DEFAULT 0 CHECK(granted_tasks >= 0),
+    reserved_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(reserved_cpu_seconds >= 0),
+    reserved_memory_hours REAL NOT NULL DEFAULT 0 CHECK(reserved_memory_hours >= 0),
+    reserved_tasks INTEGER NOT NULL DEFAULT 0 CHECK(reserved_tasks >= 0),
+    used_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(used_cpu_seconds >= 0),
+    used_memory_hours REAL NOT NULL DEFAULT 0 CHECK(used_memory_hours >= 0),
+    used_tasks INTEGER NOT NULL DEFAULT 0 CHECK(used_tasks >= 0),
+    rejected_tasks INTEGER NOT NULL DEFAULT 0 CHECK(rejected_tasks >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(project_code, period)
+);
+CREATE TABLE IF NOT EXISTS compute_budget_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_code TEXT NOT NULL,
+    period TEXT NOT NULL,
+    task_id INTEGER,
+    event_type TEXT NOT NULL CHECK(event_type IN ('grant','reserve','settle','release','deny')),
+    cpu_seconds INTEGER NOT NULL DEFAULT 0,
+    memory_hours REAL NOT NULL DEFAULT 0,
+    tasks INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compute_budget_events_scope ON compute_budget_events(project_code,period,id);
 '''
 
 PERMISSIONS = [
@@ -363,6 +405,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_columns(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -385,6 +428,31 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+
+
+def _ensure_columns(connection: sqlite3.Connection) -> None:
+    """为既有数据库文件补齐后续版本新增的列，保持幂等。"""
+    additions = {
+        "compute_templates": [
+            "ALTER TABLE compute_templates ADD COLUMN estimated_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(estimated_cpu_seconds >= 0)",
+            "ALTER TABLE compute_templates ADD COLUMN estimated_memory_hours REAL NOT NULL DEFAULT 0 CHECK(estimated_memory_hours >= 0)",
+        ],
+        "compute_tasks": [
+            "ALTER TABLE compute_tasks ADD COLUMN estimated_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(estimated_cpu_seconds >= 0)",
+            "ALTER TABLE compute_tasks ADD COLUMN estimated_memory_hours REAL NOT NULL DEFAULT 0 CHECK(estimated_memory_hours >= 0)",
+            "ALTER TABLE compute_tasks ADD COLUMN budget_period TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE compute_tasks ADD COLUMN budget_reserved INTEGER NOT NULL DEFAULT 0 CHECK(budget_reserved IN (0,1))",
+            "ALTER TABLE compute_tasks ADD COLUMN reserved_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(reserved_cpu_seconds >= 0)",
+            "ALTER TABLE compute_tasks ADD COLUMN reserved_memory_hours REAL NOT NULL DEFAULT 0 CHECK(reserved_memory_hours >= 0)",
+            "ALTER TABLE compute_tasks ADD COLUMN budget_denied_period TEXT NOT NULL DEFAULT ''",
+        ],
+    }
+    for table, statements in additions.items():
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        for statement in statements:
+            column = statement.split("ADD COLUMN", 1)[1].strip().split()[0]
+            if column not in existing:
+                connection.execute(statement)
 
 
 def migrate_db() -> None:

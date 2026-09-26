@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchOperation, BudgetAdjust, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -25,6 +25,21 @@ def create_template(payload: TemplateCreate, actor: str = Query(..., min_length=
 @router.put("/quotas")
 def set_quota(payload: QuotaSet, actor: str = Query(..., min_length=1)):
     return service().set_quota(payload.model_dump(), actor)
+
+
+@router.post("/budgets/adjust")
+def adjust_budget(payload: BudgetAdjust, actor: str = Query(..., min_length=1)):
+    return service().adjust_budget(payload.model_dump(), actor)
+
+
+@router.get("/budgets/summary")
+def budget_summary(project_code: str = Query(..., min_length=1), period: str | None = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")):
+    return service().budget_summary(project_code, period)
+
+
+@router.get("/budgets/events")
+def budget_events(project_code: str = Query(..., min_length=1), period: str | None = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"), limit: int = Query(default=100, ge=1, le=500)):
+    return {"items": service().budget_events(project_code, period, limit)}
 
 
 @router.post("/tasks", status_code=202)
@@ -59,7 +74,7 @@ def complete_task(task_id: int, payload: TaskResult):
 
 @router.post("/tasks/{task_id}/fail")
 def fail_task(task_id: int, payload: TaskFailure):
-    return service().fail(task_id, payload.worker_id, payload.error_code, payload.message, payload.retryable)
+    return service().fail(task_id, payload.worker_id, payload.error_code, payload.message, payload.retryable, payload.metrics)
 
 
 @router.post("/tasks/{task_id}/cancel")
