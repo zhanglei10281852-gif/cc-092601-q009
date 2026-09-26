@@ -21,10 +21,10 @@ class ComputeRepository:
         rows = self.connection.execute("SELECT * FROM compute_templates WHERE active=1 ORDER BY code,version").fetchall()
         return [dict(row) for row in rows]
 
-    def create_template(self, *, code: str, name: str, algorithm: str, parameter_schema: dict[str, Any], defaults: dict[str, Any], max_runtime_seconds: int, max_attempts: int, created_by: str, now: str) -> dict[str, Any]:
+    def create_template(self, *, code: str, name: str, algorithm: str, parameter_schema: dict[str, Any], defaults: dict[str, Any], max_runtime_seconds: int, max_attempts: int, est_cpu_seconds: int, est_memory_gb_hours: float, created_by: str, now: str) -> dict[str, Any]:
         cursor = self.connection.execute(
-            "INSERT INTO compute_templates(code,name,algorithm,version,parameter_schema_json,default_parameters_json,max_runtime_seconds,max_attempts,active,created_by,created_at,updated_at) VALUES(?,?,?,1,?,?,?,?,1,?,?,?)",
-            (code, name, algorithm, json.dumps(parameter_schema, ensure_ascii=False, sort_keys=True), json.dumps(defaults, ensure_ascii=False, sort_keys=True), max_runtime_seconds, max_attempts, created_by, now, now),
+            "INSERT INTO compute_templates(code,name,algorithm,version,parameter_schema_json,default_parameters_json,max_runtime_seconds,max_attempts,est_cpu_seconds,est_memory_gb_hours,active,created_by,created_at,updated_at) VALUES(?,?,?,1,?,?,?,?,?,?,1,?,?,?)",
+            (code, name, algorithm, json.dumps(parameter_schema, ensure_ascii=False, sort_keys=True), json.dumps(defaults, ensure_ascii=False, sort_keys=True), max_runtime_seconds, max_attempts, est_cpu_seconds, est_memory_gb_hours, created_by, now, now),
         )
         return dict(self.template_by_id(cursor.lastrowid))
 
@@ -58,7 +58,7 @@ class ComputeRepository:
         )
         return dict(self.task_by_id(cursor.lastrowid))
 
-    def queued_candidate(self, capabilities: Iterable[str], now: str) -> sqlite3.Row | None:
+    def queued_candidates(self, capabilities: Iterable[str], now: str, limit: int = 20) -> list[sqlite3.Row]:
         capability_list = sorted(set(capabilities))
         params: list[Any] = [now]
         condition = ""
@@ -66,10 +66,11 @@ class ComputeRepository:
             placeholders = ",".join("?" for _ in capability_list)
             condition = f" AND tpl.algorithm IN ({placeholders})"
             params.extend(capability_list)
+        params.append(limit)
         return self.connection.execute(
-            "SELECT t.*,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.status='queued' AND t.available_at<=?" + condition + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
+            "SELECT t.*,tpl.algorithm AS template_algorithm,tpl.est_cpu_seconds AS est_cpu_seconds,tpl.est_memory_gb_hours AS est_memory_gb_hours FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.status='queued' AND t.available_at<=?" + condition + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT ?",
             params,
-        ).fetchone()
+        ).fetchall()
 
     def result_versions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_results WHERE task_id=? ORDER BY version", (task_id,)).fetchall()]
@@ -99,6 +100,92 @@ class ComputeRepository:
         values.append(limit)
         rows = self.connection.execute(
             "SELECT t.*,tpl.code AS template_code,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id" + where + " ORDER BY t.priority DESC,t.created_at DESC,t.id DESC LIMIT ?",
+            values,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def budget_account(self, project_code: str, period_start: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_budget_accounts WHERE project_code=? AND period_start=?", (project_code, period_start)).fetchone()
+
+    def budget_account_by_id(self, account_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_budget_accounts WHERE id=?", (account_id,)).fetchone()
+
+    def latest_budget_account_before(self, project_code: str, period_start: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_budget_accounts WHERE project_code=? AND period_start<? ORDER BY period_start DESC LIMIT 1", (project_code, period_start)).fetchone()
+
+    def current_budget_accounts(self, period_start: str) -> list[sqlite3.Row]:
+        return self.connection.execute("SELECT * FROM compute_budget_accounts WHERE period_start=? ORDER BY project_code", (period_start,)).fetchall()
+
+    def create_budget_account(self, *, project_code: str, period_start: str, period_end: str, cpu_seconds_limit: int, memory_gb_hours_limit: float, task_count_limit: int, now: str) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            "INSERT INTO compute_budget_accounts(project_code,period_start,period_end,cpu_seconds_limit,memory_gb_hours_limit,task_count_limit,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (project_code, period_start, period_end, cpu_seconds_limit, memory_gb_hours_limit, task_count_limit, now, now),
+        )
+        return dict(self.budget_account_by_id(cursor.lastrowid))
+
+    def update_budget_limits(self, account_id: int, *, cpu_seconds_limit: int, memory_gb_hours_limit: float, task_count_limit: int, now: str) -> None:
+        self.connection.execute(
+            "UPDATE compute_budget_accounts SET cpu_seconds_limit=?,memory_gb_hours_limit=?,task_count_limit=?,updated_at=? WHERE id=?",
+            (cpu_seconds_limit, memory_gb_hours_limit, task_count_limit, now, account_id),
+        )
+
+    def try_reserve_budget(self, account_id: int, *, cpu_seconds: int, memory_gb_hours: float, task_count: int, now: str) -> bool:
+        cursor = self.connection.execute(
+            "UPDATE compute_budget_accounts SET cpu_seconds_reserved=cpu_seconds_reserved+?,memory_gb_hours_reserved=memory_gb_hours_reserved+?,task_count_reserved=task_count_reserved+?,updated_at=? WHERE id=? AND cpu_seconds_limit-cpu_seconds_used-cpu_seconds_reserved>=? AND memory_gb_hours_limit-memory_gb_hours_used-memory_gb_hours_reserved>=? AND task_count_limit-task_count_used-task_count_reserved>=?",
+            (cpu_seconds, memory_gb_hours, task_count, now, account_id, cpu_seconds, memory_gb_hours, task_count),
+        )
+        return cursor.rowcount == 1
+
+    def create_budget_reservation(self, *, account_id: int, task_id: int, attempt: int, cpu_seconds: int, memory_gb_hours: float, task_count: int, now: str) -> None:
+        self.connection.execute(
+            "INSERT INTO compute_budget_reservations(account_id,task_id,attempt,cpu_seconds,memory_gb_hours,task_count,status,created_at) VALUES(?,?,?,?,?,?,'active',?)",
+            (account_id, task_id, attempt, cpu_seconds, memory_gb_hours, task_count, now),
+        )
+
+    def active_reservation_for_task(self, task_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_budget_reservations WHERE task_id=? AND status='active' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+
+    def count_active_reservations(self, account_id: int) -> int:
+        return int(self.connection.execute("SELECT COUNT(*) FROM compute_budget_reservations WHERE account_id=? AND status='active'", (account_id,)).fetchone()[0])
+
+    def settle_budget_reservation(self, reservation: sqlite3.Row, *, actual_cpu_seconds: int, actual_memory_gb_hours: float, now: str) -> None:
+        cursor = self.connection.execute("UPDATE compute_budget_reservations SET status='settled',closed_at=? WHERE id=? AND status='active'", (now, reservation["id"]))
+        if cursor.rowcount != 1:
+            return
+        self.connection.execute(
+            "UPDATE compute_budget_accounts SET cpu_seconds_reserved=MAX(0,cpu_seconds_reserved-?),memory_gb_hours_reserved=MAX(0.0,memory_gb_hours_reserved-?),task_count_reserved=MAX(0,task_count_reserved-?),cpu_seconds_used=cpu_seconds_used+?,memory_gb_hours_used=memory_gb_hours_used+?,task_count_used=task_count_used+?,updated_at=? WHERE id=?",
+            (reservation["cpu_seconds"], reservation["memory_gb_hours"], reservation["task_count"], actual_cpu_seconds, actual_memory_gb_hours, reservation["task_count"], now, reservation["account_id"]),
+        )
+
+    def release_budget_reservation(self, reservation: sqlite3.Row, *, now: str) -> None:
+        cursor = self.connection.execute("UPDATE compute_budget_reservations SET status='released',closed_at=? WHERE id=? AND status='active'", (now, reservation["id"]))
+        if cursor.rowcount != 1:
+            return
+        self.connection.execute(
+            "UPDATE compute_budget_accounts SET cpu_seconds_reserved=MAX(0,cpu_seconds_reserved-?),memory_gb_hours_reserved=MAX(0.0,memory_gb_hours_reserved-?),task_count_reserved=MAX(0,task_count_reserved-?),updated_at=? WHERE id=?",
+            (reservation["cpu_seconds"], reservation["memory_gb_hours"], reservation["task_count"], now, reservation["account_id"]),
+        )
+
+    def increment_budget_rejected(self, account_id: int, now: str) -> None:
+        self.connection.execute("UPDATE compute_budget_accounts SET rejected_count=rejected_count+1,updated_at=? WHERE id=?", (now, account_id))
+
+    def set_task_queue_reason(self, task_id: int, code: str, message: str, now: str) -> None:
+        self.connection.execute("UPDATE compute_tasks SET queue_reason_code=?,queue_reason_message=?,updated_at=? WHERE id=?", (code, message, now, task_id))
+
+    def add_budget_adjustment(self, *, account_id: int, actor: str, reason: str, cpu_seconds_delta: int, memory_gb_hours_delta: float, task_count_delta: int, before: dict[str, Any], after: dict[str, Any], now: str) -> None:
+        self.connection.execute(
+            "INSERT INTO compute_budget_adjustments(account_id,actor,reason,cpu_seconds_delta,memory_gb_hours_delta,task_count_delta,before_json,after_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (account_id, actor, reason, cpu_seconds_delta, memory_gb_hours_delta, task_count_delta, json.dumps(before, ensure_ascii=False, sort_keys=True), json.dumps(after, ensure_ascii=False, sort_keys=True), now),
+        )
+
+    def budget_adjustments(self, project_code: str, period_start: str | None = None) -> list[dict[str, Any]]:
+        clause = "WHERE a.project_code=?"
+        values: list[Any] = [project_code]
+        if period_start is not None:
+            clause += " AND a.period_start=?"
+            values.append(period_start)
+        rows = self.connection.execute(
+            "SELECT adj.*,a.project_code AS project_code,a.period_start AS period_start FROM compute_budget_adjustments adj JOIN compute_budget_accounts a ON a.id=adj.account_id " + clause + " ORDER BY adj.id DESC",
             values,
         ).fetchall()
         return [dict(row) for row in rows]

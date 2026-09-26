@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchOperation, BudgetAdjust, BudgetSet, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -25,6 +25,26 @@ def create_template(payload: TemplateCreate, actor: str = Query(..., min_length=
 @router.put("/quotas")
 def set_quota(payload: QuotaSet, actor: str = Query(..., min_length=1)):
     return service().set_quota(payload.model_dump(), actor)
+
+
+@router.put("/budgets")
+def set_budget(payload: BudgetSet, actor: str = Query(..., min_length=1)):
+    return service().set_budget(payload.model_dump(), actor)
+
+
+@router.post("/budgets/adjustments")
+def adjust_budget(payload: BudgetAdjust, actor: str = Query(..., min_length=1)):
+    return service().adjust_budget(payload.model_dump(), actor)
+
+
+@router.get("/budgets/{project_code}")
+def budget_summary(project_code: str, period: str | None = None):
+    return service().budget_summary(project_code, period)
+
+
+@router.get("/budgets/{project_code}/adjustments")
+def budget_adjustments(project_code: str, period: str | None = None):
+    return {"items": service().list_budget_adjustments(project_code, period)}
 
 
 @router.post("/tasks", status_code=202)
@@ -59,7 +79,7 @@ def complete_task(task_id: int, payload: TaskResult):
 
 @router.post("/tasks/{task_id}/fail")
 def fail_task(task_id: int, payload: TaskFailure):
-    return service().fail(task_id, payload.worker_id, payload.error_code, payload.message, payload.retryable)
+    return service().fail(task_id, payload.worker_id, payload.error_code, payload.message, payload.retryable, payload.metrics)
 
 
 @router.post("/tasks/{task_id}/cancel")

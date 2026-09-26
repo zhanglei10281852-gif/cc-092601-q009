@@ -226,6 +226,8 @@ CREATE TABLE IF NOT EXISTS compute_templates (
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
     max_runtime_seconds INTEGER NOT NULL CHECK(max_runtime_seconds > 0),
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    est_cpu_seconds INTEGER NOT NULL DEFAULT 0 CHECK(est_cpu_seconds >= 0),
+    est_memory_gb_hours REAL NOT NULL DEFAULT 0 CHECK(est_memory_gb_hours >= 0),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -258,6 +260,8 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     available_at TEXT NOT NULL,
     lease_owner TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT '',
+    queue_reason_code TEXT NOT NULL DEFAULT '',
+    queue_reason_message TEXT NOT NULL DEFAULT '',
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
@@ -293,6 +297,55 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+
+CREATE TABLE IF NOT EXISTS compute_budget_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_code TEXT NOT NULL,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    cpu_seconds_limit INTEGER NOT NULL CHECK(cpu_seconds_limit >= 0),
+    memory_gb_hours_limit REAL NOT NULL CHECK(memory_gb_hours_limit >= 0),
+    task_count_limit INTEGER NOT NULL CHECK(task_count_limit >= 0),
+    cpu_seconds_reserved INTEGER NOT NULL DEFAULT 0,
+    memory_gb_hours_reserved REAL NOT NULL DEFAULT 0,
+    task_count_reserved INTEGER NOT NULL DEFAULT 0,
+    cpu_seconds_used INTEGER NOT NULL DEFAULT 0,
+    memory_gb_hours_used REAL NOT NULL DEFAULT 0,
+    task_count_used INTEGER NOT NULL DEFAULT 0,
+    rejected_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(project_code, period_start)
+);
+
+CREATE TABLE IF NOT EXISTS compute_budget_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES compute_budget_accounts(id) ON DELETE RESTRICT,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL,
+    cpu_seconds INTEGER NOT NULL,
+    memory_gb_hours REAL NOT NULL,
+    task_count INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','settled','released')),
+    created_at TEXT NOT NULL,
+    closed_at TEXT,
+    UNIQUE(task_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_budget_reservations_account ON compute_budget_reservations(account_id,status);
+
+CREATE TABLE IF NOT EXISTS compute_budget_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES compute_budget_accounts(id) ON DELETE CASCADE,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    cpu_seconds_delta INTEGER NOT NULL DEFAULT 0,
+    memory_gb_hours_delta REAL NOT NULL DEFAULT 0,
+    task_count_delta INTEGER NOT NULL DEFAULT 0,
+    before_json TEXT NOT NULL,
+    after_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_budget_adjustments_account ON compute_budget_adjustments(account_id,id);
 '''
 
 PERMISSIONS = [
@@ -359,10 +412,25 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_columns(connection: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in columns.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_columns(connection, "compute_templates", {
+            "est_cpu_seconds": "INTEGER NOT NULL DEFAULT 0",
+            "est_memory_gb_hours": "REAL NOT NULL DEFAULT 0",
+        })
+        _ensure_columns(connection, "compute_tasks", {
+            "queue_reason_code": "TEXT NOT NULL DEFAULT ''",
+            "queue_reason_message": "TEXT NOT NULL DEFAULT ''",
+        })
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

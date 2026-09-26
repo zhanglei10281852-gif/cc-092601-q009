@@ -13,6 +13,8 @@ class TemplateCreate(BaseModel):
     default_parameters: dict[str, Any] = Field(default_factory=dict)
     max_runtime_seconds: int = Field(default=600, ge=1, le=86400)
     max_attempts: int = Field(default=3, ge=1, le=20)
+    est_cpu_seconds: int = Field(default=0, ge=0, le=10**9)
+    est_memory_gb_hours: float = Field(default=0.0, ge=0, le=10**7)
 
 
 class QuotaSet(BaseModel):
@@ -21,6 +23,28 @@ class QuotaSet(BaseModel):
     max_queued: int = Field(default=20, ge=0, le=100000)
     max_running: int = Field(default=4, ge=0, le=10000)
     daily_submissions: int = Field(default=200, ge=0, le=1000000)
+
+
+class BudgetSet(BaseModel):
+    """设定项目在某个周期（UTC 自然月）的资源预算，period 为周期内任意 ISO 时间，默认当前周期。"""
+
+    project_code: str = Field(min_length=1, max_length=80)
+    period: str | None = Field(default=None, max_length=40)
+    cpu_seconds_limit: int = Field(ge=0, le=10**12)
+    memory_gb_hours_limit: float = Field(ge=0, le=10**9)
+    task_count_limit: int = Field(ge=0, le=10**6)
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class BudgetAdjust(BaseModel):
+    """在现有预算基础上追加（或调减）额度，所有调整必须填写说明。"""
+
+    project_code: str = Field(min_length=1, max_length=80)
+    period: str | None = Field(default=None, max_length=40)
+    cpu_seconds_delta: int = Field(default=0, ge=-(10**12), le=10**12)
+    memory_gb_hours_delta: float = Field(default=0.0, ge=-(10**9), le=10**9)
+    task_count_delta: int = Field(default=0, ge=-(10**6), le=10**6)
+    reason: str = Field(min_length=2, max_length=1000)
 
 
 class TaskSubmit(BaseModel):
@@ -49,6 +73,7 @@ class TaskFailure(BaseModel):
     error_code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
     retryable: bool = True
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class CancelRequest(BaseModel):
